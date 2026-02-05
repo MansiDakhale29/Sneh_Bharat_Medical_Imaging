@@ -10,7 +10,7 @@ This service handles:
 ## Supported Inputs
 - DICOM (.dcm)
 - X-ray / CT / MRI images (.jpg, .png)
-- Medical PDFs (.pdf)
+- Medical PDFs (.pdf) for text based and scanned based as well
 
 ## Key Features
 - Robust OCR with preprocessing
