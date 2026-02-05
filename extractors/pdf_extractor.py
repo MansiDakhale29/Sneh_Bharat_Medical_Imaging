@@ -1,211 +1,228 @@
-# pdf_extractor.py
+# extractors/pdf_extractor.py
 
-import PyPDF2
+import os
 import re
+import tempfile
 from datetime import datetime
 from typing import Dict, Any
 
+import PyPDF2
+from pdf2image import convert_from_path
+from PIL import Image
+
+# OCR
+try:
+    from extractors.ocr_report_extractor import OCRReportExtractor
+except ImportError:
+    OCRReportExtractor = None
+
+
 class MedicalPDFExtractor:
     """
-    Extract structured information from medical PDF reports
+    Extract structured information from medical PDF reports.
+
+    Supports:
+    - Text-based PDFs (PyPDF2)
+    - Image-based / scanned PDFs (OCR via OCRReportExtractor)
     """
-    
+
+    def __init__(self, use_ocr: bool = True, ocr_threshold: int = 100):
+        """
+        Args:
+            use_ocr: enable OCR fallback
+            ocr_threshold: min text length to consider PDF as text-based
+        """
+        self.use_ocr = use_ocr
+        self.ocr_threshold = ocr_threshold
+        self.ocr_extractor = OCRReportExtractor() if use_ocr and OCRReportExtractor else None
+
+    # ===================== MAIN =====================
+
     def extract(self, file_path: str) -> Dict[str, Any]:
-        """
-        Extract all information from PDF report
-        """
         extracted_data = {
-            'file_info': self._get_file_info(file_path),
-            'patient_info': {},
-            'report_info': {},
-            'clinical_data': {},
-            'measurements': {},
-            'raw_text': ''
+            "file_info": self._get_file_info(file_path),
+            "patient_information": {},
+            "study_information": {},
+            "clinical_information": {},
+            "measurements": {},
+            "raw_text": "",
+            "extraction_method": "text",
+            "processing_info": {
+                "extracted_at": datetime.now().isoformat()
+            }
         }
-        
-        # Extract all text from PDF
-        with open(file_path, 'rb') as f:
-            pdf = PyPDF2.PdfReader(f)
-            
-            full_text = ''
-            for page in pdf.pages:
-                full_text += page.extract_text() + '\n'
-            
-            extracted_data['raw_text'] = full_text
-        
-        # Parse patient information
-        extracted_data['patient_info'] = self._extract_patient_info(full_text)
-        
-        # Parse report information
-        extracted_data['report_info'] = self._extract_report_info(full_text)
-        
-        # Parse clinical data
-        extracted_data['clinical_data'] = self._extract_clinical_data(full_text)
-        
-        # Extract measurements
-        extracted_data['measurements'] = self._extract_measurements(full_text)
-        
+
+        # 1️⃣ Try text extraction
+        text = self._extract_text_from_pdf(file_path)
+
+        # 2️⃣ Decide OCR or not
+        if len(text.strip()) < self.ocr_threshold and self.use_ocr:
+            extracted_data["extraction_method"] = "ocr"
+            return self._extract_via_ocr(file_path)
+
+        # 3️⃣ Parse text-based PDF
+        extracted_data["raw_text"] = text
+        extracted_data["patient_information"] = self._extract_patient_info(text)
+        extracted_data["study_information"] = self._extract_report_info(text)
+        extracted_data["clinical_information"] = self._extract_clinical_data(text)
+        extracted_data["measurements"] = self._extract_measurements(text)
+
         return extracted_data
-    
-    def _get_file_info(self, file_path):
-        """Get basic file information"""
-        import os
-        return {
-            'filename': os.path.basename(file_path),
-            'file_size_mb': round(os.path.getsize(file_path) / (1024 * 1024), 2)
+
+    # ===================== OCR PDF =====================
+
+    def _extract_via_ocr(self, file_path: str, dpi: int = 300) -> Dict[str, Any]:
+        if not self.ocr_extractor:
+            return {
+                "file_info": self._get_file_info(file_path),
+                "error": "OCR extractor not available",
+                "patient_information": {},
+                "study_information": {},
+                "clinical_information": {},
+                "measurements": {},
+                "raw_text": ""
+            }
+
+        images = convert_from_path(file_path, dpi=dpi)
+
+        combined_text = ""
+        final_result = {}
+
+        for idx, image in enumerate(images):
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                image.save(tmp.name, "PNG")
+                page_result = self.ocr_extractor.extract_from_image(tmp.name)
+
+            os.remove(tmp.name)
+
+            combined_text += f"\n--- Page {idx + 1} ---\n{page_result.get('raw_text', '')}\n"
+
+            if idx == 0:
+                final_result = page_result
+
+        # 🔁 Normalize keys for DB compatibility
+        normalized = {
+            "file_info": self._get_file_info(file_path),
+            "source_type": "ocr_pdf",
+            "extraction_method": "ocr",
+            "processing_info": {
+                "extracted_at": datetime.now().isoformat(),
+                "method": "pdf_to_image_ocr"
+            },
+            "raw_text": combined_text,
+            "patient_information": final_result.get("patient_info", {}),
+            "study_information": final_result.get("report_info", {}),
+            "clinical_information": final_result.get("clinical_data", {}),
+            "measurements": final_result.get("measurements", {})
         }
-    
+
+        return normalized
+
+    # ===================== TEXT PDF =====================
+
+    def _extract_text_from_pdf(self, file_path: str) -> str:
+        text = ""
+        try:
+            with open(file_path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                for page in reader.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+        except Exception as e:
+            print("PDF text extraction error:", e)
+        return text
+
+    # ===================== PARSERS =====================
+
     def _extract_patient_info(self, text: str) -> Dict[str, str]:
-        """
-        Extract patient information from text
-        """
-        patient_info = {}
-        
-        # Patient ID
-        match = re.search(r'Patient\s*ID[:\s]+([\w-]+)', text, re.IGNORECASE)
-        if match:
-            patient_info['patient_id'] = match.group(1).strip()
-        
-        # Patient Name
-        match = re.search(r'Patient\s*Name[:\s]+([A-Za-z\s]+?)(?:\n|Patient)', text, re.IGNORECASE)
-        if match:
-            patient_info['patient_name'] = match.group(1).strip()
-        
-        # Age
-        match = re.search(r'Age[:\s]+(\d+)', text, re.IGNORECASE)
-        if match:
-            patient_info['age'] = match.group(1)
-        
-        # Sex/Gender
-        match = re.search(r'(?:Sex|Gender)[:\s]+(Male|Female|M|F)', text, re.IGNORECASE)
-        if match:
-            patient_info['sex'] = match.group(1).upper()[0]
-        
-        return patient_info
-    
+        info = {}
+
+        patterns = {
+            "patient_id": [
+                r'Patient\s*[I1]D[:\s]+([\w-]+)',
+                r'UHID[:\s]+([\w-]+)',
+                r'Reg\.?\s*No\.?[:\s]+([\w-]+)'
+            ],
+            "patient_name": [
+                r'Patient\s*(?:Name|Namo)[:\s]+([A-Z][A-Z\s]+)',
+                r'(?:Name|Namo)[:\s]+([A-Z][A-Z\s]+)'
+            ],
+            "patient_age": [
+                r'Age[:\s]+(\d+)',
+                r'(\d+)\s*[Yy]'
+            ],
+            "patient_sex": [
+                r'Sex[:\s]+(Male|Female|M|F)',
+                r'\d+\s*[Yy]\s*(M|F)'
+            ]
+        }
+
+        for key, plist in patterns.items():
+            for p in plist:
+                m = re.search(p, text, re.IGNORECASE)
+                if m:
+                    val = m.group(1).strip()
+                    if key == "patient_sex":
+                        val = "M" if val.upper().startswith("M") else "F"
+                    info[key] = val
+                    break
+
+        return info
+
     def _extract_report_info(self, text: str) -> Dict[str, str]:
-        """
-        Extract report metadata
-        """
-        report_info = {}
-        
-        # Report Date
+        info = {}
+
         date_patterns = [
-            r'(?:Report\s*Date|Date)[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+            r'(?:Report\s*Date|Date)[:\s]+(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})',
             r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})'
         ]
-        for pattern in date_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                report_info['report_date'] = match.group(1)
+
+        for p in date_patterns:
+            m = re.search(p, text, re.IGNORECASE)
+            if m:
+                info["report_date"] = m.group(1)
                 break
-        
-        # Report Type
-        type_patterns = [
-            r'(CT\s*Scan|MRI|X-Ray|Ultrasound|Radiology)\s*Report',
-            r'Report\s*Type[:\s]+([A-Za-z\s]+)'
-        ]
-        for pattern in type_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                report_info['report_type'] = match.group(1).strip()
+
+        modalities = ["CT", "MRI", "X-RAY", "XRAY", "ULTRASOUND", "USG"]
+        for mod in modalities:
+            if mod in text.upper():
+                info["modality"] = mod
                 break
-        
-        # Reported By (Radiologist)
-        match = re.search(r'(?:Reported\s*By|Radiologist)[:\s]+([A-Za-z.\s]+?)(?:\n|,)', text, re.IGNORECASE)
-        if match:
-            report_info['reported_by'] = match.group(1).strip()
-        
-        return report_info
-    
+
+        return info
+
     def _extract_clinical_data(self, text: str) -> Dict[str, str]:
-        """
-        Extract clinical findings and impressions
-        """
-        clinical_data = {}
-        
-        # Chief Complaint
-        match = re.search(r'(?:Chief\s*Complaint|Complaint)[:\s]+(.+?)(?:\n\n|\n[A-Z])', text, re.IGNORECASE | re.DOTALL)
-        if match:
-            clinical_data['chief_complaint'] = match.group(1).strip()
-        
-        # Clinical History
-        match = re.search(r'(?:Clinical\s*History|History)[:\s]+(.+?)(?:\n\n|\n[A-Z])', text, re.IGNORECASE | re.DOTALL)
-        if match:
-            clinical_data['clinical_history'] = match.group(1).strip()
-        
-        # Findings
-        match = re.search(r'(?:Findings|Observation)[:\s]+(.+?)(?:\n\n|Impression)', text, re.IGNORECASE | re.DOTALL)
-        if match:
-            clinical_data['findings'] = match.group(1).strip()
-        
-        # Impression/Diagnosis
-        match = re.search(r'(?:Impression|Diagnosis)[:\s]+(.+?)(?:\n\n|Recommendation)', text, re.IGNORECASE | re.DOTALL)
-        if match:
-            clinical_data['impression'] = match.group(1).strip()
-        
-        # Recommendations
-        match = re.search(r'(?:Recommendation|Advice)[s]?[:\s]+(.+?)(?:\n\n|\Z)', text, re.IGNORECASE | re.DOTALL)
-        if match:
-            clinical_data['recommendations'] = match.group(1).strip()
-        
-        return clinical_data
-    
+        data = {}
+
+        sections = {
+            "findings": r'(Findings|Observations?)[:\s]+(.+?)(?=Impression|Conclusion|Advice|$)',
+            "impression": r'(Impression|Conclusion|Diagnosis)[:\s]+(.+?)(?=Advice|$)',
+            "recommendations": r'(Advice|Recommendation)[:\s]+(.+?)$'
+        }
+
+        for key, pattern in sections.items():
+            m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+            if m:
+                data[key] = m.group(2).strip()
+
+        return data
+
     def _extract_measurements(self, text: str) -> Dict[str, Any]:
-        """
-        Extract all measurements from text
-        """
         measurements = {}
-        
-        # Size measurements
-        size_matches = re.finditer(
-            r'(?:size|diameter|length|width|height|dimension)[:\s]*([\d.]+)\s*([xX×]\s*[\d.]+)?[\s]*(mm|cm|m)',
-            text,
-            re.IGNORECASE
-        )
-        for i, match in enumerate(size_matches):
-            measurements[f'size_{i+1}'] = {
-                'value': match.group(1),
-                'unit': match.group(3),
-                'full_text': match.group(0)
+        pattern = r'(\d+\.?\d*)\s*(mm|cm|ml|HU|mg|kg|L|cc)'
+        for i, m in enumerate(re.finditer(pattern, text, re.IGNORECASE)):
+            measurements[f"measurement_{i+1}"] = {
+                "value": float(m.group(1)),
+                "unit": m.group(2)
             }
-        
-        # Volume measurements
-        volume_matches = re.finditer(
-            r'volume[:\s]*([\d.]+)\s*(ml|cc|L)',
-            text,
-            re.IGNORECASE
-        )
-        for i, match in enumerate(volume_matches):
-            measurements[f'volume_{i+1}'] = {
-                'value': match.group(1),
-                'unit': match.group(2),
-                'full_text': match.group(0)
-            }
-        
-        # Density (HU - Hounsfield Units for CT)
-        density_matches = re.finditer(
-            r'([\d.]+)\s*HU',
-            text
-        )
-        for i, match in enumerate(density_matches):
-            measurements[f'density_{i+1}'] = {
-                'value': match.group(1),
-                'unit': 'HU',
-                'full_text': match.group(0)
-            }
-        
-        # Heart-specific measurements
-        heart_matches = re.finditer(
-            r'(?:cardiothoracic\s*ratio|CTR)[:\s]*([\d.]+)',
-            text,
-            re.IGNORECASE
-        )
-        for i, match in enumerate(heart_matches):
-            measurements['cardiothoracic_ratio'] = {
-                'value': match.group(1),
-                'type': 'ratio',
-                'full_text': match.group(0)
-            }
-        
         return measurements
+
+    # ===================== UTILS =====================
+
+    def _get_file_info(self, file_path: str) -> Dict[str, Any]:
+        return {
+            "filename": os.path.basename(file_path),
+            "file_size_mb": round(os.path.getsize(file_path) / (1024 * 1024), 2),
+            "format": os.path.splitext(file_path)[1]
+        }
